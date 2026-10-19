@@ -1,0 +1,205 @@
+# =============================================================================
+# pcd_to_nav2_map 設定ファイル
+#
+#   GLIM の 3D 点群地図 (.pcd) → Nav2 (ROS 2 Humble) 用 2D OccupancyGrid
+#   (map.pgm / map.yaml) への変換パラメータ。
+#
+# 単位の約束:
+#   長さ = [m]，角度 = [deg]（origin_yaw のみ Nav2 仕様に合わせて [rad]），
+#   個数 = [points] または [cells]
+#
+# 座標系の前提:
+#   入力 PCD は GLIM のグローバル地図座標系（Z 軸が鉛直上向き）に存在する。
+#   出力 2D 地図の XY 座標は入力点群の XY 座標と一致する（回転・平行移動なし）。
+# =============================================================================
+
+input:
+  # GLIM が出力したグローバル座標系の点群地図
+  pcd_path: "./data/pointcloud_map.pcd"
+
+output:
+  # 出力先ディレクトリ（存在しなければ作成）
+  directory: "./output"
+  # 出力ファイルのベース名 → <map_name>.pgm / <map_name>.yaml
+  map_name: "map"
+  # preview.png（生成地図の確認画像）を保存するか
+  save_preview: true
+  # conversion.log（処理結果・使用パラメータ）を保存するか
+  save_log: true
+
+# -----------------------------------------------------------------------------
+# 点群の前処理（処理順は上から下）
+# -----------------------------------------------------------------------------
+preprocessing:
+  # NaN / Inf を含む無効点を削除する
+  remove_invalid_points: true
+
+  # 絶対 Z 座標（GLIM 座標系）による粗い切り出し。
+  # 地下に落ちた外れ点や高所の反射ノイズを事前に捨てる用途。
+  # ※ 障害物の高さ判定は height_filter で別に行う。
+  height_crop:
+    enabled: false
+    min_z: -2.0     # [m] この Z 未満の点を削除
+    max_z: 5.0      # [m] この Z より上の点を削除
+
+  # Voxel Downsampling（Open3D）。巨大な点群の処理時間とメモリを抑える。
+  # ★ voxel_size は map.resolution の半分以下を推奨。resolution と同じにすると
+  #   1 セルあたり約 1 点しか残らず，min_points_per_cell の判定で地図が虫食いになる。
+  voxel_downsample:
+    enabled: true
+    voxel_size: 0.02   # [m]
+
+  # Statistical Outlier Removal（Open3D）。孤立ノイズ点の除去。
+  statistical_outlier:
+    enabled: false
+    nb_neighbors: 20   # [points] 統計を取る近傍点数
+    std_ratio: 2.0     # 平均距離の標準偏差の何倍を超えたら外れ点とみなすか
+
+# -----------------------------------------------------------------------------
+# 2D 地図の範囲と解像度
+# -----------------------------------------------------------------------------
+map:
+  # 1 セルの一辺 [m]。Nav2 の map.yaml の resolution にそのまま書き出される。
+  resolution: 0.05
+
+  # bounds.enabled = false のとき，点群の XY 最小・最大値にこの余白を加えて
+  # 地図範囲を自動決定する。map.yaml の origin は (min_x - padding, min_y - padding)。
+  padding: 1.0    # [m]
+
+  # 地図範囲を明示指定する場合（GLIM 座標系 [m]）。
+  # 有効時はこの範囲外の点を切り捨て，origin は (min_x, min_y) になる。
+  bounds:
+    enabled: false
+    min_x: -20.0
+    max_x: 20.0
+    min_y: -20.0
+    max_y: 20.0
+
+  # map.yaml の origin 第 3 要素 (yaw) [rad]。
+  # 本ツールのグリッドは GLIM 座標軸に平行に生成されるため，通常は 0.0 のまま。
+  # 0 以外を設定するとグリッドは回転されず yaw だけが書き出されるので警告する。
+  origin_yaw: 0.0
+
+  # 「Z 軸が鉛直」という前提の検証。推定床面付近の点から平面の傾きを求め，
+  # max_tilt_deg を超えると警告する（処理は続行する）。
+  vertical_axis_check:
+    enabled: true
+    max_tilt_deg: 5.0        # [deg] 許容する床面法線の Z 軸からの傾き
+    band_height: 0.30        # [m] 床面推定値の上下この範囲の点で傾きを評価
+    sample_points: 50000     # [points] 評価に使う最大点数（ランダム抽出）
+
+# -----------------------------------------------------------------------------
+# 高さフィルタリングと障害物判定
+# -----------------------------------------------------------------------------
+height_filter:
+  # 障害物高さ (obstacle.min_height / max_height) の基準
+  #   "absolute"          : GLIM 地図座標系の絶対 Z [m] として扱う
+  #   "relative_to_floor" : 推定した床面からの相対高さ [m] として扱う
+  mode: "relative_to_floor"
+
+  # 床面推定。relative_to_floor の高さ基準，および free_space.floor_based の
+  # 「床を観測した点」の判定に使われる（absolute モードでも後者で使用）。
+  floor:
+    # "fixed"      : 水平床を仮定し fixed_z を床の Z とする（最も単純・確実）
+    # "percentile" : 水平床を仮定し，全点 Z の下位 percentile [%] を床 Z とする
+    # "ransac"     : Open3D の RANSAC 平面推定で床平面（傾き可）を求める
+    method: "fixed"
+
+    # [m] method=fixed のときの床の Z 座標。
+    # ★ GLIM の地図座標系における絶対 Z であり，床からの相対高さではない。
+    fixed_z: 0.0
+
+    # [%] method=percentile のときに床 Z とみなす Z 値の下側パーセンタイル
+    percentile: 2.0
+
+    # method=ransac 用パラメータ
+    ransac_distance_threshold: 0.05   # [m] 平面インライアとみなす距離
+    ransac_iterations: 1000           # RANSAC 反復回数
+    ransac_max_points: 200000         # [points] 計算に使う最大点数（ランダム抽出）
+    # RANSAC の候補点を絶対 Z で絞る（天井や机の天板を床と誤認するのを防ぐ）
+    ransac_z_range:
+      enabled: false
+      min_z: -1.0   # [m]
+      max_z: 0.5    # [m]
+
+  obstacle:
+    # 障害物として扱う高さ範囲 [m]（基準は height_filter.mode による）。
+    # min_height を床の凹凸より大きく，max_height をロボットの全高程度にすると，
+    # 床のノイズと天井を障害物から除外できる。
+    min_height: 0.10
+    max_height: 1.80
+    # [points] この数以上の範囲内点を含むセルを Occupied とする
+    min_points_per_cell: 2
+
+# -----------------------------------------------------------------------------
+# Free Space（走行可能領域）の推定
+#   PCD だけでは LiDAR の観測位置・方向が分からず Ray Casting ができないため，
+#   「点がないセル = Free」とは判定しない。どの方法にも限界があることに注意。
+# -----------------------------------------------------------------------------
+free_space:
+  # "floor_based"     : 床面を観測した点が十分あり，障害物がないセルを Free（既定）
+  # "unknown_default" : Free を推定せず，障害物以外はすべて Unknown
+  # "bounded_free"    : 地図範囲内の障害物以外をすべて Free（未観測領域も Free になる）
+  method: "floor_based"
+
+  floor_based:
+    # [m] 床面推定値からこの範囲内の点を「床の観測点」とみなす
+    floor_height_tolerance: 0.08
+    # [points] この数以上の床点を含むセルを Free の候補とする
+    min_floor_points_per_cell: 2
+    # 床観測セルが地図全体に占める割合がこの値未満のとき警告する（0.0〜1.0）
+    min_floor_coverage_warn: 0.05
+
+# -----------------------------------------------------------------------------
+# 地図の後処理（セル単位の形態学的処理）
+#   Unknown を無条件に Free へ変換する処理はない。
+# -----------------------------------------------------------------------------
+postprocessing:
+  # 小さな孤立障害物（連結成分）を除去する。除去後のセルは，床観測があれば Free，
+  # なければ Unknown に戻る。
+  remove_small_obstacles:
+    enabled: false
+    min_size_cells: 3     # [cells] この未満の連結成分を除去
+    connectivity: 8       # 連結の定義 4 or 8
+
+  # 障害物に完全に囲まれた小さな穴（非 Occupied 領域）を Occupied で埋める
+  fill_small_holes:
+    enabled: false
+    max_size_cells: 3     # [cells] この以下の穴を埋める
+
+  # Free に完全に囲まれた小さな Unknown を Free にする。
+  # ★ 観測に基づかない推測なので既定は無効。有効化時は警告を出す。
+  fill_small_unknown_in_free:
+    enabled: false
+    max_size_cells: 3     # [cells]
+
+  # Occupied の収縮（細い誤検出を削る）。削れたセルは Free または Unknown に戻る。
+  erosion:
+    enabled: false
+    iterations: 1         # [cells] 3x3 カーネルの適用回数（≒ 収縮量）
+
+  # Occupied の膨張。Nav2 Costmap の Inflation Layer と二重になるため既定は無効。
+  dilation:
+    enabled: false
+    iterations: 1         # [cells] 3x3 カーネルの適用回数（≒ 膨張量）
+
+# -----------------------------------------------------------------------------
+# Nav2 map_server (map.yaml) のパラメータ
+#   trinary モード: occ = (255 - pixel) / 255 として
+#     occ > occupied_thresh → 100 (Occupied),  occ < free_thresh → 0 (Free), それ以外 → -1 (Unknown)
+#   本ツールの画素値 Free=254 / Occupied=0 / Unknown=205 は以下の既定値で正しく分類される。
+# -----------------------------------------------------------------------------
+nav2:
+  mode: "trinary"
+  negate: 0
+  occupied_thresh: 0.65
+  free_thresh: 0.196
+
+# -----------------------------------------------------------------------------
+# プレビュー画像 (preview.png)
+# -----------------------------------------------------------------------------
+visualization:
+  enabled: true        # false にすると output.save_preview が true でも生成しない
+  show_grid: false     # 1 m 間隔のグリッド線を描く
+  show_axes: true      # 世界座標 [m] の軸ラベルを描く
+  dpi: 150             # 画像の解像度 [dpi]

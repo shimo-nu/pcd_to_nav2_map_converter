@@ -1,0 +1,9 @@
+# pcd_to_nav2_map の依存ライブラリ（ROS 2 は不要）
+open3d>=0.17
+numpy>=1.24
+pillow>=9.0
+pyyaml>=6.0
+scipy>=1.10
+matplotlib>=3.7
+# テスト用
+pytest>=7.0
